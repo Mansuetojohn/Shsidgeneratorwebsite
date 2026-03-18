@@ -23,18 +23,87 @@ export function ExcelUpload({ onStudentsLoaded, onShowPreview }: ExcelUploadProp
     return timestamp + random;
   };
 
+  // Convert an external image URL to a base64 data URI to avoid CORS issues during canvas rendering
+  const convertImageUrlToBase64 = (url: string): Promise<string> => {
+    return new Promise((resolve) => {
+      if (!url || url.startsWith('data:')) {
+        resolve(url);
+        return;
+      }
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.naturalWidth || img.width;
+          canvas.height = img.naturalHeight || img.height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) { resolve(url); return; }
+          ctx.drawImage(img, 0, 0);
+          resolve(canvas.toDataURL('image/jpeg', 0.92));
+        } catch {
+          // If tainted canvas, fall back to original URL
+          resolve(url);
+        }
+      };
+      img.onerror = () => resolve(url); // fall back to original on error
+      img.src = url;
+    });
+  };
+
   const parseCSV = (text: string): any[] => {
-    const lines = text.split('\n').filter(line => line.trim());
+    // Strip BOM (Byte Order Mark) that Excel sometimes adds
+    const cleaned = text.replace(/^\uFEFF/, '');
+
+    // Normalize all line endings (Windows \r\n, old Mac \r, Unix \n)
+    const normalized = cleaned.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const lines = normalized.split('\n').filter(line => line.trim());
     if (lines.length < 2) return [];
 
-    const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+    // Auto-detect delimiter: comma, tab, or semicolon
+    const firstLine = lines[0];
+    let delimiter = ',';
+    const tabCount = (firstLine.match(/\t/g) || []).length;
+    const semicolonCount = (firstLine.match(/;/g) || []).length;
+    const commaCount = (firstLine.match(/,/g) || []).length;
+    if (tabCount > commaCount && tabCount > semicolonCount) delimiter = '\t';
+    else if (semicolonCount > commaCount) delimiter = ';';
+
+    // Parse a single CSV line respecting quoted fields
+    const parseLine = (line: string): string[] => {
+      const result: string[] = [];
+      let current = '';
+      let inQuotes = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') {
+          if (inQuotes && line[i + 1] === '"') {
+            current += '"';
+            i++;
+          } else {
+            inQuotes = !inQuotes;
+          }
+        } else if (ch === delimiter && !inQuotes) {
+          result.push(current.trim());
+          current = '';
+        } else {
+          current += ch;
+        }
+      }
+      result.push(current.trim());
+      return result;
+    };
+
+    const rawHeaders = parseLine(lines[0]);
+    // Clean headers: remove BOM remnants and extra whitespace/quotes
+    const headers = rawHeaders.map(h => h.replace(/^\uFEFF/, '').replace(/^["']|["']$/g, '').trim());
     const rows = [];
 
     for (let i = 1; i < lines.length; i++) {
-      const values = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, ''));
+      const values = parseLine(lines[i]);
       const row: any = {};
       headers.forEach((header, index) => {
-        row[header] = values[index] || '';
+        row[header] = values[index]?.replace(/^["']|["']$/g, '').trim() || '';
       });
       rows.push(row);
     }
@@ -55,7 +124,16 @@ export function ExcelUpload({ onStudentsLoaded, onShowPreview }: ExcelUploadProp
       const jsonData = parseCSV(text);
 
       if (jsonData.length === 0) {
-        throw new Error('The CSV file is empty');
+        // Give a more helpful diagnosis
+        const cleaned = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        const lineCount = cleaned.split('\n').filter(l => l.trim()).length;
+        if (lineCount === 0) {
+          throw new Error('The file appears to be empty. Please check the file and try again.');
+        } else if (lineCount === 1) {
+          throw new Error('The CSV only has a header row — no student data rows were found. Please add student data below the header row.');
+        } else {
+          throw new Error(`Could not parse the CSV file (${lineCount} lines detected). Make sure it is saved as CSV format (not .xlsx) and uses comma, tab, or semicolon separators.`);
+        }
       }
 
       // Validate required columns
@@ -67,8 +145,8 @@ export function ExcelUpload({ onStudentsLoaded, onShowPreview }: ExcelUploadProp
         throw new Error(`Missing required columns: ${missingColumns.join(', ')}`);
       }
 
-      // Process students
-      const students: StudentData[] = jsonData.map((row, index) => {
+      // Process students (build raw list first)
+      const rawStudents = jsonData.map((row, index) => {
         const birthdate = row.Birthdate || '';
         
         if (!birthdate) {
@@ -83,15 +161,37 @@ export function ExcelUpload({ onStudentsLoaded, onShowPreview }: ExcelUploadProp
           strand: row.Strand?.toString().trim() || '',
           grade: row.Grade?.toString().trim() || '',
           lrn: generateLRN(),
-          photo: row['Photo URL']?.toString().trim() || 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="200" height="200"%3E%3Crect fill="%23f0f0f0" width="200" height="200"/%3E%3Ctext x="50%25" y="50%25" dominant-baseline="middle" text-anchor="middle" fill="%23999" font-size="14"%3ENo Photo%3C/text%3E%3C/svg%3E',
+          photoUrl: row['Photo URL']?.toString().trim() || '',
         };
       });
 
       // Validate all students have required data
-      const invalidStudents = students.filter(s => !s.firstName || !s.lastName || !s.birthdate || !s.strand || !s.grade);
+      const invalidStudents = rawStudents.filter(s => !s.firstName || !s.lastName || !s.birthdate || !s.strand || !s.grade);
       if (invalidStudents.length > 0) {
         throw new Error(`Some rows are missing required information`);
       }
+
+      // Convert external photo URLs to base64 to avoid CORS issues
+      const noPhotoPlaceholder = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="200" height="200"%3E%3Crect fill="%23f0f0f0" width="200" height="200"/%3E%3Ctext x="50%25" y="50%25" dominant-baseline="middle" text-anchor="middle" fill="%23999" font-size="14"%3ENo Photo%3C/text%3E%3C/svg%3E';
+
+      const students: StudentData[] = await Promise.all(
+        rawStudents.map(async (raw) => {
+          let photo = noPhotoPlaceholder;
+          if (raw.photoUrl) {
+            photo = await convertImageUrlToBase64(raw.photoUrl);
+          }
+          return {
+            firstName: raw.firstName,
+            middleName: raw.middleName,
+            lastName: raw.lastName,
+            birthdate: raw.birthdate,
+            strand: raw.strand,
+            grade: raw.grade,
+            lrn: raw.lrn,
+            photo,
+          };
+        })
+      );
 
       onStudentsLoaded(students);
       setSuccess(`Successfully loaded ${students.length} student(s)`);

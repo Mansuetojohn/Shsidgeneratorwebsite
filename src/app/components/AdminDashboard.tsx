@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { Button } from './ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Download, Trash2, RefreshCw, FileSpreadsheet, Eye, X } from 'lucide-react';
-import { projectId, publicAnonKey } from '../../utils/supabase/info';
+import { projectId, publicAnonKey } from '../../../utils/supabase/info';
 
 interface IDRecord {
   id: string;
@@ -33,12 +33,23 @@ export function AdminDashboard({ onClose }: { onClose: () => void }) {
           'Authorization': `Bearer ${publicAnonKey}`,
         },
       });
+      
+      if (!response.ok) {
+        console.warn(`Admin records API returned ${response.status}: ${response.statusText}`);
+        setRecords([]);
+        setTotalCount(0);
+        alert('Unable to connect to database. Please check your connection and try again.');
+        return;
+      }
+      
       const data = await response.json();
       setRecords(data.records || []);
       setTotalCount(data.total || 0);
     } catch (error) {
       console.error('Error loading records:', error);
-      alert('Failed to load records');
+      setRecords([]);
+      setTotalCount(0);
+      alert('Failed to load records. Please check your internet connection.');
     } finally {
       setLoading(false);
     }
